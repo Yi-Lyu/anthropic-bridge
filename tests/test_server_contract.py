@@ -7,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 import anthropic_bridge.server as server_module
 from anthropic_bridge.protocol import estimate_anthropic_input_tokens, iter_sse_events
+from anthropic_bridge.providers.responses_api import build_responses_input
 from anthropic_bridge.server import AnthropicBridge, ProxyConfig
 
 from .conftest import CALCULATOR_TOOL
@@ -324,6 +325,107 @@ def test_count_tokens_include_tools_and_tool_history() -> None:
     assert estimate_anthropic_input_tokens(
         with_history
     ) > estimate_anthropic_input_tokens(with_tools)
+
+
+def test_build_responses_input_preserves_text_and_image_blocks() -> None:
+    _, input_messages = build_responses_input(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this image?"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "abc123",
+                            },
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert input_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is in this image?"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,abc123",
+                },
+            ],
+        }
+    ]
+
+
+def test_build_responses_input_flushes_media_before_tool_result() -> None:
+    _, input_messages = build_responses_input(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Inspect this."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "abc123",
+                            },
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "content": "done",
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert input_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Inspect this."},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,abc123",
+                },
+            ],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "tool_1",
+            "output": "done",
+        },
+    ]
+
+
+def test_build_responses_input_rejects_malformed_image_blocks() -> None:
+    with pytest.raises(ValueError, match="media_type"):
+        build_responses_input(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "data": "abc123"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
 
 
 @pytest.mark.asyncio

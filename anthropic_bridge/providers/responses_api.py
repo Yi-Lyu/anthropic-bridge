@@ -10,6 +10,27 @@ from ..transform import normalize_system_message
 from .utils import DEFAULT_USAGE, AnthropicSSEEmitter, estimate_input_tokens
 
 
+def _convert_image_block_for_responses(item: dict[str, Any]) -> dict[str, Any]:
+    source = item.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("Image block is missing a valid source object")
+
+    if source.get("type") != "base64":
+        raise ValueError("Only base64 image sources are supported")
+
+    media_type = source.get("media_type")
+    data = source.get("data")
+    if not isinstance(media_type, str) or not media_type:
+        raise ValueError("Image block is missing media_type")
+    if not isinstance(data, str) or not data:
+        raise ValueError("Image block is missing base64 data")
+
+    return {
+        "type": "input_image",
+        "image_url": f"data:{media_type};base64,{data}",
+    }
+
+
 def build_responses_input(
     payload: dict[str, Any],
 ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -26,7 +47,35 @@ def build_responses_input(
         if not isinstance(content, list):
             continue
 
-        pending_text: list[str] = []
+        if role == "assistant":
+            text_parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+
+                item_type = item.get("type")
+                if item_type == "text":
+                    text_parts.append(item.get("text", ""))
+                elif item_type == "tool_use":
+                    if text_parts:
+                        input_messages.append(
+                            {"role": role, "content": "\n".join(text_parts)}
+                        )
+                        text_parts.clear()
+                    input_messages.append(
+                        {
+                            "type": "function_call",
+                            "call_id": item.get("id", ""),
+                            "name": item.get("name", ""),
+                            "arguments": json.dumps(item.get("input", {})),
+                        }
+                    )
+
+            if text_parts:
+                input_messages.append({"role": role, "content": "\n".join(text_parts)})
+            continue
+
+        pending_content: list[dict[str, Any]] = []
 
         for item in content:
             if not isinstance(item, dict):
@@ -34,14 +83,20 @@ def build_responses_input(
 
             item_type = item.get("type")
             if item_type == "text":
-                pending_text.append(item.get("text", ""))
+                pending_content.append(
+                    {"type": "input_text", "text": item.get("text", "")}
+                )
                 continue
 
-            if pending_text:
+            if item_type == "image":
+                pending_content.append(_convert_image_block_for_responses(item))
+                continue
+
+            if pending_content:
                 input_messages.append(
-                    {"role": role, "content": "\n".join(pending_text)}
+                    {"role": role, "content": list(pending_content)}
                 )
-                pending_text.clear()
+                pending_content.clear()
 
             if item_type == "tool_result":
                 result_content = item.get("content", "")
@@ -64,8 +119,8 @@ def build_responses_input(
                     }
                 )
 
-        if pending_text:
-            input_messages.append({"role": role, "content": "\n".join(pending_text)})
+        if pending_content:
+            input_messages.append({"role": role, "content": pending_content})
 
     return system, input_messages
 
@@ -114,7 +169,16 @@ def _estimate_responses_input_tokens(
         messages.append({"role": "system", "content": instructions})
     for item in input_messages:
         if item.get("role"):
-            messages.append({"role": item["role"], "content": item.get("content", "")})
+            content = item.get("content", "")
+            if isinstance(content, list):
+                text_parts = [
+                    {"type": "text", "text": part.get("text", "")}
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "input_text"
+                ]
+                messages.append({"role": item["role"], "content": text_parts})
+            else:
+                messages.append({"role": item["role"], "content": content})
         elif item.get("type") == "function_call_output":
             messages.append({"role": "tool", "content": item.get("output", "")})
         elif item.get("type") == "function_call":
