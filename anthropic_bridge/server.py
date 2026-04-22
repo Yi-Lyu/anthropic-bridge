@@ -1,3 +1,5 @@
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Literal
 
@@ -5,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .access_log import log_event
 from .cache import get_reasoning_cache
 from .protocol import collect_anthropic_response, estimate_anthropic_input_tokens
 from .providers import CopilotProvider, OpenAIProvider, OpenRouterProvider
@@ -38,6 +41,42 @@ class AnthropicBridge:
             allow_headers=["*"],
         )
 
+        # Structured access log (one JSON event per request completion).
+        # Emits to the file at $ANTHROPIC_BRIDGE_LOG_FILE and stdout.
+        # Business fields (model, has_tools, usage, streaming) are emitted
+        # from the provider so this middleware stays cheap and non-intrusive.
+        @self.app.middleware("http")
+        async def _access_log(request: Request, call_next):
+            req_id = uuid.uuid4().hex[:12]
+            request.state.req_id = req_id
+            start = time.perf_counter()
+            client_ip = request.client.host if request.client else None
+
+            status = 500
+            error_msg: str | None = None
+            try:
+                response = await call_next(request)
+                status = response.status_code
+                return response
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {e}"
+                raise
+            finally:
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                event: dict = {
+                    "level": "info" if (status < 500 and not error_msg) else "error",
+                    "action": "http_access",
+                    "req_id": req_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": status,
+                    "duration_ms": duration_ms,
+                    "client_ip": client_ip,
+                }
+                if error_msg:
+                    event["error"] = error_msg
+                log_event(event)
+
     def _setup_routes(self) -> None:
         @self.app.get("/")
         async def root() -> dict[str, str]:
@@ -56,6 +95,27 @@ class AnthropicBridge:
         async def messages(request: Request) -> StreamingResponse | JSONResponse:
             body = await request.json()
             model = body.get("model", "")
+            req_id = getattr(request.state, "req_id", None)
+
+            # Business-level access event. Pairs with the middleware's
+            # "http_access" event via req_id. Captures what the Anthropic
+            # client requested (model, stream, tools, message count) —
+            # distinct from the upstream-side model which the provider
+            # may override via OPENAI_RESPONSES_MODEL_OVERRIDE.
+            messages_list = body.get("messages") or []
+            tools_list = body.get("tools") or []
+            log_event(
+                {
+                    "level": "info",
+                    "action": "bridge_request",
+                    "req_id": req_id,
+                    "anthropic_model": model,
+                    "streaming": body.get("stream") is True,
+                    "has_tools": len(tools_list) > 0,
+                    "messages_count": len(messages_list),
+                    "system_present": body.get("system") is not None,
+                }
+            )
 
             provider = self._get_provider(model)
             if provider is None:
