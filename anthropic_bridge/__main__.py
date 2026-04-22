@@ -30,7 +30,17 @@ def main() -> None:
         print("  OpenRouter: openrouter/* models")
     else:
         print("  OpenRouter: disabled (set OPENROUTER_API_KEY)")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # Graceful shutdown: give in-flight streaming requests (up to ~300s of
+    # codex inference) a chance to drain before uvicorn kills them. systemd's
+    # TimeoutStopSec (15s on our unit) will still force-kill if something is
+    # stuck beyond this, so 60s is the ceiling the process will wait.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        timeout_graceful_shutdown=60,
+    )
 
 
 if __name__ == "__main__":
