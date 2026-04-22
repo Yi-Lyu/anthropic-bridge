@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .cache import get_reasoning_cache
 from .protocol import collect_anthropic_response, estimate_anthropic_input_tokens
 from .providers import CopilotProvider, OpenAIProvider, OpenRouterProvider
-from .providers.openai.auth import auth_file_exists
+from .providers.openai.auth import auth_file_exists, static_bearer_available
 
 ProviderType = Literal["openrouter", "copilot", "openai"]
 
@@ -158,7 +158,9 @@ class AnthropicBridge:
                 )
             return self._copilot_clients[model]
 
-        if provider_type == "openai" and auth_file_exists():
+        if provider_type == "openai" and (
+            auth_file_exists() or static_bearer_available()
+        ):
             if model not in self._openai_clients:
                 self._openai_clients[model] = OpenAIProvider(model)
             return self._openai_clients[model]

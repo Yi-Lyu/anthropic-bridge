@@ -21,7 +21,18 @@ def main() -> None:
     )
 
     print(f"Starting Anthropic Bridge on {args.host}:{args.port}")
-    print("  OpenAI: openai/* models")
+    static_bearer = os.environ.get("OPENAI_RESPONSES_API_KEY", "")
+    endpoint = os.environ.get(
+        "OPENAI_RESPONSES_ENDPOINT",
+        "https://chatgpt.com/backend-api/codex/responses",
+    )
+    override_model = os.environ.get("OPENAI_RESPONSES_MODEL_OVERRIDE", "")
+    if static_bearer:
+        print(f"  OpenAI: static-bearer mode → {endpoint}")
+        if override_model:
+            print(f"          model override: * → {override_model}")
+    else:
+        print("  OpenAI: OAuth mode (reads ~/.codex/auth.json)")
     if copilot_token:
         print("  Copilot: copilot/* models")
     else:

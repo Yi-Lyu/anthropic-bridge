@@ -1,3 +1,4 @@
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -10,16 +11,35 @@ from ..responses_api import (
 from ..utils import map_reasoning_effort, yield_error_events
 from .auth import get_auth
 
-CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+# Endpoint is configurable via env so the same provider can target ChatGPT Codex
+# (default, via OAuth) or an arbitrary OpenAI-Responses-API compatible upstream
+# (via static bearer, e.g. CRS 5001 /openai/v1/responses in front of 88code /
+# cowcode / codeproxy).
+CODEX_API_ENDPOINT = os.getenv(
+    "OPENAI_RESPONSES_ENDPOINT",
+    "https://chatgpt.com/backend-api/codex/responses",
+)
+
+# When set, the bridge rewrites the `model` field on every upstream request.
+# Used to map Anthropic model names (e.g. "claude-opus-4-6") to the OpenAI
+# model the upstream actually serves (e.g. "gpt-5.3-codex").
+OVERRIDE_MODEL = os.getenv("OPENAI_RESPONSES_MODEL_OVERRIDE")
 
 
 class OpenAIProvider:
     def __init__(self, target_model: str):
         self.target_model = target_model.removeprefix("openai/")
+        # Static bearer mode: when OPENAI_RESPONSES_API_KEY is set, skip the
+        # Codex CLI OAuth flow entirely and use this bearer for upstream auth.
+        # OAuth path stays intact so `codex login` keeps working.
+        self._static_bearer: str | None = os.getenv("OPENAI_RESPONSES_API_KEY")
         self._access_token: str | None = None
         self._account_id: str | None = None
         self._expires_at: float = 0
-        self._use_verbosity = self._supports_verbosity(self.target_model)
+        # Pick verbosity hint based on the *upstream* model (override-aware).
+        self._use_verbosity = self._supports_verbosity(
+            OVERRIDE_MODEL or self.target_model
+        )
 
     @staticmethod
     def _supports_verbosity(model_id: str) -> bool:
@@ -38,15 +58,24 @@ class OpenAIProvider:
 
     async def handle(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         try:
-            self._access_token, self._account_id, self._expires_at = await get_auth(
-                self._access_token, self._account_id, self._expires_at
-            )
+            if self._static_bearer:
+                # Static bearer mode — no OAuth refresh, no Codex account id.
+                self._access_token = self._static_bearer
+                self._account_id = None
+            else:
+                self._access_token, self._account_id, self._expires_at = await get_auth(
+                    self._access_token, self._account_id, self._expires_at
+                )
 
             instructions, input_messages = build_responses_input(payload)
             tools = convert_tools_for_responses(payload.get("tools"))
 
+            # Model override lets one bridge instance translate Anthropic model
+            # names into the OpenAI model the upstream actually exposes.
+            upstream_model = OVERRIDE_MODEL or self.target_model
+
             request_body: dict[str, Any] = {
-                "model": self.target_model,
+                "model": upstream_model,
                 "input": input_messages,
                 "stream": True,
                 "store": False,
