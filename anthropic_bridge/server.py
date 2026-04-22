@@ -1,5 +1,7 @@
+import asyncio
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -12,6 +14,61 @@ from .cache import get_reasoning_cache
 from .protocol import collect_anthropic_response, estimate_anthropic_input_tokens
 from .providers import CopilotProvider, OpenAIProvider, OpenRouterProvider
 from .providers.openai.auth import auth_file_exists, static_bearer_available
+
+
+async def _cancel_on_client_disconnect(
+    request: Request,
+    upstream: AsyncIterator[str],
+    req_id: str | None,
+) -> AsyncIterator[str]:
+    """Wrap an SSE generator so that if the client goes away, the upstream
+    httpx request inside ``upstream`` is promptly closed instead of continuing
+    to burn tokens. We do this by polling ``request.is_disconnected()`` in a
+    background task and calling ``upstream.aclose()`` in finally, which
+    propagates cancellation to the provider's ``async with httpx.AsyncClient``.
+
+    Note: ``is_disconnected()`` is less reliable under BaseHTTPMiddleware,
+    which is what FastAPI's ``@app.middleware("http")`` uses. The finally-
+    path ``aclose()`` is the real guarantee — even without watcher firing,
+    when FastAPI decides the request is over, it closes the async generator,
+    which runs our finally block.
+    """
+    disconnected = asyncio.Event()
+
+    async def _watch() -> None:
+        try:
+            while not disconnected.is_set():
+                if await request.is_disconnected():
+                    disconnected.set()
+                    return
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+
+    watcher = asyncio.create_task(_watch())
+    emitted_bytes = 0
+    try:
+        async for chunk in upstream:
+            if disconnected.is_set():
+                log_event({
+                    "level": "warn",
+                    "action": "client_disconnected_mid_stream",
+                    "req_id": req_id,
+                    "emitted_bytes": emitted_bytes,
+                })
+                break
+            emitted_bytes += len(chunk)
+            yield chunk
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await upstream.aclose()
+        except Exception:
+            pass
 
 ProviderType = Literal["openrouter", "copilot", "openai"]
 
@@ -150,7 +207,7 @@ class AnthropicBridge:
                 return JSONResponse(message)
 
             return StreamingResponse(
-                provider.handle(body),
+                _cancel_on_client_disconnect(request, provider.handle(body), req_id),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
