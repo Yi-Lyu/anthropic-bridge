@@ -104,12 +104,15 @@ class AnthropicBridge:
             # may override via OPENAI_RESPONSES_MODEL_OVERRIDE.
             messages_list = body.get("messages") or []
             tools_list = body.get("tools") or []
+            # Defensive truncation on client-controlled strings to keep
+            # log lines bounded regardless of what callers send.
+            safe_model = str(model)[:128] if model else ""
             log_event(
                 {
                     "level": "info",
                     "action": "bridge_request",
                     "req_id": req_id,
-                    "anthropic_model": model,
+                    "anthropic_model": safe_model,
                     "streaming": body.get("stream") is True,
                     "has_tools": len(tools_list) > 0,
                     "messages_count": len(messages_list),
