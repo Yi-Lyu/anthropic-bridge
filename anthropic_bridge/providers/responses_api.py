@@ -309,10 +309,25 @@ async def stream_responses_api(
                     elif current_event == "response.completed":
                         resp = event_data.get("response", {})
                         resp_usage = resp.get("usage", {})
+                        # Responses API exposes prompt-cache hits at
+                        # usage.input_tokens_details.cached_tokens (some
+                        # OpenAI-compatible servers mirror to
+                        # prompt_tokens_details). Fall back to the
+                        # Anthropic-style flat key if a rare upstream
+                        # already pre-maps it.
+                        input_details = (
+                            resp_usage.get("input_tokens_details")
+                            or resp_usage.get("prompt_tokens_details")
+                            or {}
+                        )
+                        cached = (
+                            input_details.get("cached_tokens", 0)
+                            or resp_usage.get("cache_read_input_tokens", 0)
+                        )
                         usage = {
                             "input_tokens": resp_usage.get("input_tokens", 0),
                             "cache_creation_input_tokens": resp_usage.get("cache_creation_input_tokens", 0),
-                            "cache_read_input_tokens": resp_usage.get("cache_read_input_tokens", 0),
+                            "cache_read_input_tokens": cached,
                             "output_tokens": resp_usage.get("output_tokens", 0),
                         }
                         break
