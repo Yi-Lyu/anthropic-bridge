@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -14,6 +15,13 @@ AUTH_FILE_PATH = Path.home() / ".codex" / "auth.json"
 
 def auth_file_exists() -> bool:
     return AUTH_FILE_PATH.exists()
+
+
+def static_bearer_available() -> bool:
+    """True when OPENAI_RESPONSES_API_KEY is set, letting the bridge skip OAuth
+    and use a static bearer against an OpenAI-Responses-API compatible upstream.
+    """
+    return bool(os.environ.get("OPENAI_RESPONSES_API_KEY"))
 
 
 async def read_auth_file() -> dict[str, Any]:
