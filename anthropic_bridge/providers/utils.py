@@ -319,14 +319,27 @@ class AnthropicSSEEmitter:
     def tool_keys(self) -> list[str | int]:
         return list(self._tools)
 
-    def finish(self, usage: dict[str, int], signature: str = "") -> list[str]:
+    def finish(
+        self,
+        usage: dict[str, int],
+        signature: str = "",
+        stop_reason: str | None = None,
+    ) -> list[str]:
+        """Emit Anthropic message_delta + message_stop to terminate the stream.
+
+        When ``stop_reason`` is None (default), we infer tool_use vs end_turn
+        from whether any tool blocks were opened. Callers may pass an explicit
+        Anthropic stop_reason (e.g. "max_tokens", "refusal") when the upstream
+        Responses API signals response.incomplete / refusal paths.
+        """
         events: list[str] = []
         events.extend(self.close_thinking(signature))
         events.extend(self.close_text())
         for key in list(self._tools):
             events.extend(self.close_tool(key))
 
-        stop_reason = "tool_use" if self._tools else "end_turn"
+        if stop_reason is None:
+            stop_reason = "tool_use" if self._tools else "end_turn"
         events.append(sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},

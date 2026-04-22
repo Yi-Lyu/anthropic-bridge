@@ -199,6 +199,33 @@ def _estimate_responses_input_tokens(
     return estimate_input_tokens(messages, tools)
 
 
+def _extract_usage(resp_usage: dict[str, Any]) -> dict[str, int]:
+    """Map a Responses API usage object to the Anthropic usage shape.
+
+    Responses API nests prompt-cache hits under
+    ``usage.input_tokens_details.cached_tokens`` (some OpenAI-compatible
+    servers mirror to ``prompt_tokens_details``). Fall back to the
+    Anthropic-style flat key if a rare upstream pre-maps it.
+    """
+    if not isinstance(resp_usage, dict):
+        return dict(DEFAULT_USAGE)
+    input_details = (
+        resp_usage.get("input_tokens_details")
+        or resp_usage.get("prompt_tokens_details")
+        or {}
+    )
+    cached = (
+        input_details.get("cached_tokens", 0)
+        or resp_usage.get("cache_read_input_tokens", 0)
+    )
+    return {
+        "input_tokens": resp_usage.get("input_tokens", 0),
+        "cache_creation_input_tokens": resp_usage.get("cache_creation_input_tokens", 0),
+        "cache_read_input_tokens": cached,
+        "output_tokens": resp_usage.get("output_tokens", 0),
+    }
+
+
 async def stream_responses_api(
     endpoint: str,
     headers: dict[str, str],
@@ -219,6 +246,9 @@ async def stream_responses_api(
     reasoning_event_mode: Literal["summary", "reasoning"] | None = None
     arguments_streamed: dict[str, bool] = {}
     usage = dict(DEFAULT_USAGE)
+    # Set by response.incomplete / response.refusal.* branches to override
+    # the default end_turn / tool_use inference at finalize time.
+    explicit_stop_reason: str | None = None
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
@@ -308,34 +338,68 @@ async def stream_responses_api(
 
                     elif current_event == "response.completed":
                         resp = event_data.get("response", {})
-                        resp_usage = resp.get("usage", {})
-                        # Responses API exposes prompt-cache hits at
-                        # usage.input_tokens_details.cached_tokens (some
-                        # OpenAI-compatible servers mirror to
-                        # prompt_tokens_details). Fall back to the
-                        # Anthropic-style flat key if a rare upstream
-                        # already pre-maps it.
-                        input_details = (
-                            resp_usage.get("input_tokens_details")
-                            or resp_usage.get("prompt_tokens_details")
-                            or {}
-                        )
-                        cached = (
-                            input_details.get("cached_tokens", 0)
-                            or resp_usage.get("cache_read_input_tokens", 0)
-                        )
-                        usage = {
-                            "input_tokens": resp_usage.get("input_tokens", 0),
-                            "cache_creation_input_tokens": resp_usage.get("cache_creation_input_tokens", 0),
-                            "cache_read_input_tokens": cached,
-                            "output_tokens": resp_usage.get("output_tokens", 0),
-                        }
+                        usage = _extract_usage(resp.get("usage", {}))
                         break
 
+                    elif current_event == "response.incomplete":
+                        # Upstream signaled truncation (hit max_output_tokens,
+                        # content filter, or similar). Map to an explicit
+                        # Anthropic stop_reason so the client stops treating
+                        # the response as a complete success.
+                        resp = event_data.get("response", {})
+                        details = resp.get("incomplete_details") or {}
+                        reason = details.get("reason", "")
+                        if reason == "max_output_tokens":
+                            explicit_stop_reason = "max_tokens"
+                        elif reason in ("content_filter", "content_policy"):
+                            explicit_stop_reason = "refusal"
+                        else:
+                            explicit_stop_reason = "end_turn"
+                        incomplete_usage = resp.get("usage") or {}
+                        if incomplete_usage:
+                            usage = _extract_usage(incomplete_usage)
+                        break
+
+                    elif current_event == "response.failed":
+                        # Upstream raised a structured failure mid-stream.
+                        # Re-raise so the outer except emits error_and_finish,
+                        # guaranteeing the client sees a properly terminated
+                        # Anthropic stream instead of a TCP reset.
+                        resp = event_data.get("response", {})
+                        err = resp.get("error") or {}
+                        code = err.get("code", "unknown")
+                        msg = err.get("message", "upstream failed")
+                        raise RuntimeError(f"upstream response.failed [{code}]: {msg}")
+
+                    elif current_event in (
+                        "response.refusal.delta",
+                        "response.output_text.annotation.added",
+                    ):
+                        # Responses API refusal content — surface as regular
+                        # text delta so the client sees the refusal body,
+                        # then mark stop_reason=refusal on message_delta.
+                        delta = event_data.get("delta", "") or event_data.get("text", "")
+                        if delta:
+                            for _e in emitter.close_thinking():
+                                yield _e
+                            for _e in emitter.text_delta(delta):
+                                yield _e
+                        if current_event == "response.refusal.delta":
+                            explicit_stop_reason = "refusal"
+
+                    elif current_event in ("response.refusal.done",):
+                        explicit_stop_reason = "refusal"
+
     except Exception as e:
+        # A: Finalize guard — even on upstream abort / parse error, the client
+        # must receive a well-formed Anthropic message_stop. error_and_finish
+        # emits `event: error` + message_delta + message_stop.
         for _e in emitter.error_and_finish(str(e)):
             yield _e
         return
 
-    for _e in emitter.finish(usage):
+    # A: Normal finalize with optional explicit stop_reason from
+    # response.incomplete / refusal paths. usage is either from
+    # response.completed or from response.incomplete.
+    for _e in emitter.finish(usage, stop_reason=explicit_stop_reason):
         yield _e
